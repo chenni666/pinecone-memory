@@ -1,156 +1,118 @@
 ---
-name: pinecone-memory
-description: "将 OpenClaw 记忆系统接入 Pinecone 向量数据库，用于语义检索与记忆持久化。Use when: 用户要求同步记忆到 Pinecone、执行语义搜索、为记忆做云端备份、对大规模记忆进行高效检索。"
+name: memory
+description: 使用 Pinecone 作为 OpenClaw 语义记忆后端，支持记忆同步(sync)、语义检索(query)和统计(stats)。Use when: 用户要求把本地记忆同步到 Pinecone、查询历史语义记忆、验证索引状态或排查 Pinecone 记忆链路问题。
+metadata: {"openclaw":{"primaryEnv":"PINECONE_API_KEY","requires":{"env":["PINECONE_API_KEY"],"bins":["node"]}}}
 ---
 
 # Pinecone Memory Skill
 
-将 OpenClaw 本地记忆系统与 Pinecone 向量数据库连接，提供可扩展的语义检索能力。
+这个 skill 提供一个最小可运行的 Pinecone 记忆工具链：
 
-## 目标
+- `check`：检查环境变量与索引可用性。
+- `sync`：把本地 markdown 记忆切片后写入 Pinecone。
+- `query`：按文本做语义检索（优先走 Integrated Embedding 搜索接口）。
+- `stats`：查看索引和命名空间统计。
+- `heartbeat`：写入探针并验证写入可见性，用于健康检查与定时巡检。
+- `cleanup`：清理指定 namespace 的数据。
+- `backup` / `restore`：本地 JSONL 备份与恢复。
 
-- 把本地记忆持久化到向量数据库，支持长期检索与备份。
-- 在需要回忆历史上下文时，提供高相关召回结果。
-- 通过命名空间和元数据过滤控制性能、成本与安全。
+本 skill 采用 Integrated Embedding 索引（记录里必须有 `chunk_text`），默认不手动传向量。
 
-## 阅读顺序
+## 触发时机
 
-- 首次接入与运行步骤：见 setup.md。
-- 测试完成后的清理步骤：见 setup.md 的测试清理章节。
-- 本文档用于定义技能触发、检索和数据建模规则。
+- 用户说“把记忆同步到 Pinecone”。
+- 用户说“查一下以前关于 X 的记忆”。
+- 用户说“看下 Pinecone 是否正常 / 有多少数据”。
 
-## 环境要求
+## 执行流程（必须按顺序）
 
-- PINECONE_API_KEY 需要向用户获取。
-- Node.js 18+。
-- 已在 Pinecone 创建 index。
+1. 先跑环境检查：
 
-## 索引创建策略
-
-采用方案：集成嵌入（Integrated Embedding）+ Dense Index。
-
-- 直接 upsert 原始文本，由 Pinecone 自动向量化。
-- 创建 index 时指定 embed.model 和 embed.field_map。
-- field_map 的文本字段名必须与 upsert 记录字段一致（例如 chunk_text）。
-- 本技能默认语义检索，不启用 sparse index。
-
-关键约束：
-
-- Starter 计划通常只支持 aws/us-east-1。
-- cloud 和 region 创建后不可修改。
-- metric 固定使用 cosine（与本技能默认 dense 语义检索保持一致）。
-
-## 数据建模规范
-
-### 记录结构
-
-- _id：唯一标识，推荐结构化 ID，如 document1#chunk1。
-- chunk_text：文本字段（集成嵌入时用于自动向量化）。
-- metadata：用于过滤和管理，如 document_id、chunk_number、created_at、source。
-
-### 示例记录（可直接用于 upsert）
-
-```json
-{
-  "_id": "document1#chunk1",
-  "chunk_text": "First chunk of the document content...",
-  "document_id": "document1",
-  "document_title": "Introduction to Vector Databases",
-  "chunk_number": 1,
-  "document_url": "https://example.com/docs/document1",
-  "created_at": "2024-01-15",
-  "document_type": "tutorial"
-}
+```bash
+node {baseDir}/tools/pinecone-memory.mjs check --index openclaw-memory
 ```
 
-字段说明：
+2. 再做同步：
 
-- _id：结构化主键，便于按前缀批量 list/fetch。
-- chunk_text：与 embed.field_map 绑定的文本字段。
-- 其余字段作为 metadata，用于过滤、追踪来源和增量更新。
-
-### 元数据建议
-
-- 仅保留高价值过滤字段，避免冗余元数据导致查询和索引变慢。
-- metadata key 使用字符串，value 使用 string/number/boolean/string[]。
-- 单条记录 metadata 总量控制在 Pinecone 限制内。
-
-## 存储内容
-
-| 类型 | 存储内容 | 写入时机 |
-|------|----------|----------|
-| 对话记忆 | 每轮对话摘要 + 时间戳 + 标签 | 每 5 轮批量写，重要对话即时写 |
-| 项目知识 | 代码和文档按 chunk 切片 | 用户要求索引时，基于文件 hash 增量写 |
-| 用户偏好 | 格式偏好、工具习惯 | 用户明确表达或系统观察到时 |
-| 错误经验 | 命令失败记录 + 正确做法 | 失败或纠正后即时写 |
-| 知识缓存 | Web 搜索结果 + URL | 搜索后即时写，带 TTL 过期 |
-| 文件索引 | 上传文件内容摘要 | 收到文件后即时写 |
-
-## 什么时候查（触发策略）
-
-- 用户说“上次”“之前”“你还记得”时：查对话记忆 + 错误经验。
-- 用户问代码或项目问题时：查项目知识。
-- 准备执行命令前：先查历史错误经验，减少重复踩坑。
-
-## 查完之后怎么用（Agent 行为规则）
-
-1. 先做结果筛选：仅保留与当前问题直接相关的前 3-8 条记忆。
-2. 再做冲突处理：若多条记忆冲突，优先近期记录和成功案例。
-3. 然后生成回答：把检索结论合并到当前回复，不逐条转储原始命中。
-4. 涉及命令执行时：优先采用历史成功命令，并显式规避已知失败写法。
-5. 证据不足时：明确说明“不确定”，并向用户追问关键缺失信息。
-6. 写回闭环：本轮得到新结论或纠错后，按类型增量写回 Pinecone。
-
-## 什么时候不查
-
-- 闲聊、简单问候、纯计算、当前上下文已有答案时，不触发向量检索，避免延迟和 token 浪费。
-
-## 一致性与写入策略
-
-- Pinecone 为最终一致性系统，写后立即读可能短暂不可见。
-- 写入后如需立即检索，使用短暂重试或延迟机制。
-- 大规模导入时优先使用 import，常规更新使用 upsert。
-
-## 检索策略
-
-- 默认语义检索：top_k + metadata 过滤。
-- 需要更高精度时：增加 rerank。
-- 对关键词敏感任务：优先使用 metadata 过滤和本地全文补充，不切换 sparse index。
-
-## 安全
-
-- 索引前自动过滤 API Key、密码、token、.env 内容，防止敏感数据入库。
-- 不上传本地明文密钥与私有凭据。
-- 对敏感项目可按 namespace 做隔离并限制检索范围。
-
-## 技能执行约定
-
-1. 写入前先做敏感信息过滤。
-2. 写入时统一生成结构化 _id 和 metadata。
-3. 查询时优先限定 namespace，其次使用 metadata filter。
-
-## 示例配置
-
-```json
-{
-  "memory": {
-    "pinecone": {
-      "enabled": true,
-      "indexName": "openclaw-memory",
-      "namespace": "default",
-      "embeddingModel": "multilingual-e5-large",
-      "vectorType": "dense",
-      "metric": "cosine",
-      "useSparseIndex": false,
-      "rerankEnabled": true,
-      "syncOnWrite": true
-    }
-  }
-}
+```bash
+node {baseDir}/tools/pinecone-memory.mjs sync --index openclaw-memory --namespace default --path MEMORY.md --path memory
 ```
 
-## 参考文档
+默认开启增量同步（基于本地状态文件比对 source hash，仅写入变化文件）。
 
-- https://docs.pinecone.io/guides/get-started/quickstart
-- https://docs.pinecone.io/guides/index-data/create-an-index
-- https://docs.pinecone.io/guides/index-data/data-modeling
+3. 再做查询验证：
+
+```bash
+node {baseDir}/tools/pinecone-memory.mjs query --index openclaw-memory --namespace default --text "用户偏好"
+```
+
+4. 最后看统计：
+
+```bash
+node {baseDir}/tools/pinecone-memory.mjs stats --index openclaw-memory --namespace default
+```
+
+5. 健康巡检（验证“真的写入”）：
+
+```bash
+node {baseDir}/tools/pinecone-memory.mjs heartbeat --index openclaw-memory --namespace default --write-probe true
+```
+
+6. 管理命令：
+
+```bash
+node {baseDir}/tools/pinecone-memory.mjs cleanup --index openclaw-memory --namespace default --confirm yes
+node {baseDir}/tools/pinecone-memory.mjs backup --path MEMORY.md --path memory --output backup/pinecone-memory-backup.jsonl
+node {baseDir}/tools/pinecone-memory.mjs restore --input backup/pinecone-memory-backup.jsonl --index openclaw-memory --namespace default --verify-write true
+```
+
+## 存储信息模型（必须覆盖）
+
+1. 核心内容（向量主体）
+- 文档/知识库分块、网页分块、书籍/报告/论文分块、代码片段与 API 文档。
+- 写入字段：`chunk_text`（Integrated Embedding 主字段）。
+
+2. 元数据（过滤与追溯）
+- 来源：`source`、`source_url`。
+- 时间：`created_at`、`updated_at`。
+- 作者与部门：`author`、`department`。
+- 标签与分类：`tags`、`source_kind`。
+- 权限：`acl_scope`。
+- 版本：`doc_version`。
+
+3. 结构化知识块
+- 记录类型通过 `record_type` 区分：`core_content`、`qa_knowledge`、`summary`、`entity_relation`、`conversation_history`、`agent_action`、`external_knowledge`、`heartbeat`。
+
+4. 对话与交互历史
+- 历史对话、Agent 行动日志可作为 `record_type` 写入同一索引，按 namespace 隔离。
+
+5. 外部与实时信息
+- API 返回摘要、用户临时上传文件解析文本可作为短时记忆写入，建议使用单独 namespace 并定期清理。
+
+## 行为规则
+
+1. 同步前先过滤明显敏感内容（如 API key、token、密码字段）。
+2. 统一使用结构化 `_id`，格式为 `source#chunk-<n>#<hash8>`。
+3. 命名空间默认 `default`，生产与测试必须分离。
+4. 查询返回只保留高相关结果，默认 `topK=5`。
+5. `sync` 默认开启写后可见性校验，输出 `writeVerification`。
+6. `sync` 默认开启增量同步，状态保存在 `.pinecone-memory-state.json`。
+7. 若 Pinecone SDK 方法不兼容，必须给出明确报错与降级建议，不可静默失败。
+
+## 已知约束
+
+- Integrated Embedding 场景下，写入记录必须包含 `chunk_text`。
+- Pinecone 为最终一致性，写后立刻查询可能短暂不可见。
+- 不同 SDK 版本方法可能不同，本 skill 已做能力探测与兼容分支。
+
+## 目录约定
+
+- 执行脚本：`{baseDir}/tools/pinecone-memory.mjs`
+- 安装说明：`{baseDir}/SETUP.md`
+- 使用反馈：`{baseDir}/USAGE_FEEDBACK.md`
+
+## 官方参考
+
+- https://docs.openclaw.ai/tools/skills
+- https://docs.openclaw.ai/tools/creating-skills
+- https://docs.openclaw.ai/tools/clawhub
